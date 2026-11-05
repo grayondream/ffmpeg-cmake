@@ -1,0 +1,223 @@
+# =============================================================================
+# Configuration resolution.
+#
+# Mirrors the semantics of FFmpeg's configure dependency engine:
+#   deps / deps_any / conflict / select / suggest / if / if_any
+# A fixpoint loop is used instead of recursive check_deps; the result is the
+# same for the acyclic graphs used by FFmpeg.
+# =============================================================================
+
+function(ffmpeg_resolve_mark_changed)
+    set_property(GLOBAL PROPERTY FFMPEG_RESOLVE_CHANGED TRUE)
+endfunction()
+
+function(ffmpeg_resolve_disable name)
+    ffmpeg_state_get("${name}" _st)
+    if(_st STREQUAL "yes")
+        ffmpeg_state_set("${name}" no)
+        ffmpeg_resolve_mark_changed()
+    endif()
+endfunction()
+
+function(ffmpeg_resolve_weak_enable name)
+    ffmpeg_base_get("${name}" _base)
+    if(_base STREQUAL "no")
+        return()
+    endif()
+    ffmpeg_state_get("${name}" _st)
+    if(_st STREQUAL "unset" OR _st STREQUAL "")
+        ffmpeg_state_set("${name}" yes)
+        ffmpeg_resolve_mark_changed()
+    endif()
+endfunction()
+
+function(ffmpeg_get_dep name type out)
+    set(_v "")
+    get_property(_v GLOBAL PROPERTY "FFMPEG_DEP_${name}_${type}")
+    set(${out} "${_v}" PARENT_SCOPE)
+endfunction()
+
+function(ffmpeg_resolve_configuration)
+    # Every library and program takes part in dependency resolution.
+    foreach(_lib IN LISTS FFMPEG_LIBRARY_LIST)
+        ffmpeg_add_resolve_name("${_lib}")
+    endforeach()
+    foreach(_prog IN LISTS FFMPEG_PROGRAM_LIST)
+        ffmpeg_add_resolve_name("${_prog}")
+    endforeach()
+
+    get_property(_names GLOBAL PROPERTY FFMPEG_RESOLVE_NAMES)
+
+    # -- initial state ----------------------------------------------------
+    foreach(_name IN LISTS _names)
+        set(_cur "")
+        string(TOLOWER "${_name}" _lname)
+        get_property(_cur GLOBAL PROPERTY "FFMPEG_STATE_${_lname}")
+        string(LENGTH "${_cur}" _cur_len)
+        if(NOT _cur_len EQUAL 0)
+            continue()          # already decided by detection
+        endif()
+
+        ffmpeg_base_get("${_name}" _base)
+        set(_kind "")
+        get_property(_kind GLOBAL PROPERTY "FFMPEG_COMPONENT_KIND_${_name}")
+
+        if(_base STREQUAL "yes")
+            ffmpeg_state_set("${_name}" yes)
+        elseif(_base STREQUAL "no")
+            ffmpeg_state_set("${_name}" no)
+        else()
+            string(LENGTH "${_kind}" _kind_len)
+            if(_kind_len EQUAL 0)
+                # Not a component: only enabled when something selects it.
+                ffmpeg_state_set("${_name}" unset)
+            elseif(FFMPEG_DISABLE_EVERYTHING)
+                ffmpeg_state_set("${_name}" no)
+            else()
+                # Components are on by default unless --disable-everything.
+                ffmpeg_state_set("${_name}" yes)
+            endif()
+        endif()
+    endforeach()
+
+    foreach(_lib IN LISTS FFMPEG_LIBRARY_LIST)
+        ffmpeg_state_get("${_lib}" _st)
+        if(_st STREQUAL "")
+            ffmpeg_state_set("${_lib}" yes)
+        endif()
+    endforeach()
+
+    # -- fixpoint ---------------------------------------------------------
+    set(_iter 0)
+    while(TRUE)
+        math(EXPR _iter "${_iter}+1")
+        if(_iter GREATER 200)
+            ffmpeg_warn("dependency resolution did not converge after 200 iterations")
+            break()
+        endif()
+        set_property(GLOBAL PROPERTY FFMPEG_RESOLVE_CHANGED FALSE)
+
+        # 1. propagate selects / suggests of enabled configurations
+        foreach(_name IN LISTS _names)
+            ffmpeg_state_get("${_name}" _st)
+            if(NOT _st STREQUAL "yes")
+                continue()
+            endif()
+
+            ffmpeg_get_dep("${_name}" select _select)
+            foreach(_sel IN LISTS _select)
+                if(NOT _sel MATCHES "^!")
+                    ffmpeg_resolve_weak_enable("${_sel}")
+                endif()
+            endforeach()
+
+            ffmpeg_get_dep("${_name}" suggest _suggest)
+            foreach(_sug IN LISTS _suggest)
+                if(NOT _sug MATCHES "^!")
+                    ffmpeg_resolve_weak_enable("${_sug}")
+                endif()
+            endforeach()
+        endforeach()
+
+        # 2. validate currently enabled configurations
+        foreach(_name IN LISTS _names)
+            ffmpeg_state_get("${_name}" _st)
+            if(NOT _st STREQUAL "yes")
+                continue()
+            endif()
+
+            ffmpeg_get_dep("${_name}" deps _deps)
+            if(_deps)
+                ffmpeg_enabled_all("${_deps}" _ok)
+                if(NOT _ok)
+                    ffmpeg_resolve_disable("${_name}")
+                    continue()
+                endif()
+            endif()
+
+            ffmpeg_get_dep("${_name}" deps_any _deps_any)
+            if(_deps_any)
+                ffmpeg_enabled_any("${_deps_any}" _ok)
+                if(NOT _ok)
+                    ffmpeg_resolve_disable("${_name}")
+                    continue()
+                endif()
+            endif()
+
+            ffmpeg_get_dep("${_name}" select _select)
+            if(_select)
+                set(_select_ok TRUE)
+                foreach(_sel IN LISTS _select)
+                    if(_sel MATCHES "^!")
+                        string(REGEX REPLACE "^!" "" _sel "${_sel}")
+                        ffmpeg_state_get("${_sel}" _ss)
+                        if(_ss STREQUAL "yes")
+                            set(_select_ok FALSE)
+                            break()
+                        endif()
+                    else()
+                        ffmpeg_state_get("${_sel}" _ss)
+                        if(NOT _ss STREQUAL "yes")
+                            set(_select_ok FALSE)
+                            break()
+                        endif()
+                    endif()
+                endforeach()
+                if(NOT _select_ok)
+                    ffmpeg_resolve_disable("${_name}")
+                    continue()
+                endif()
+            endif()
+        endforeach()
+
+        # 2b. conflicts are evaluated after the dependency pass so that a
+        # configuration which is about to disappear because of its own
+        # dependencies cannot wrongly disable its peers.
+        foreach(_name IN LISTS _names)
+            ffmpeg_state_get("${_name}" _st)
+            if(NOT _st STREQUAL "yes")
+                continue()
+            endif()
+            ffmpeg_get_dep("${_name}" conflict _conflict)
+            if(_conflict)
+                ffmpeg_enabled_any("${_conflict}" _ok)
+                if(_ok)
+                    ffmpeg_resolve_disable("${_name}")
+                endif()
+            endif()
+        endforeach()
+
+        # 3. conditional (weak) enabling
+        foreach(_name IN LISTS _names)
+            ffmpeg_get_dep("${_name}" if _ifa)
+            if(_ifa)
+                ffmpeg_enabled_all("${_ifa}" _ok)
+                if(_ok)
+                    ffmpeg_resolve_weak_enable("${_name}")
+                endif()
+            endif()
+            ffmpeg_get_dep("${_name}" if_any _ifn)
+            if(_ifn)
+                ffmpeg_enabled_any("${_ifn}" _ok)
+                if(_ok)
+                    ffmpeg_resolve_weak_enable("${_name}")
+                endif()
+            endif()
+        endforeach()
+
+        get_property(_changed GLOBAL PROPERTY FFMPEG_RESOLVE_CHANGED)
+        if(NOT _changed)
+            break()
+        endif()
+    endwhile()
+
+    # -- report -----------------------------------------------------------
+    set(_enabled_count 0)
+    foreach(_name IN LISTS _names)
+        ffmpeg_state_get("${_name}" _st)
+        if(_st STREQUAL "yes")
+            math(EXPR _enabled_count "${_enabled_count}+1")
+        endif()
+    endforeach()
+    ffmpeg_status("configuration resolved: ${_enabled_count} enabled entries (${_iter} passes)")
+endfunction()
