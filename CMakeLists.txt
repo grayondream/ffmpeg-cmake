@@ -40,9 +40,57 @@ set(FFMPEG_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}/third_party/ffmpeg"
 set(FFMPEG_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/ffmpeg-gen"
     CACHE PATH "Directory for generated FFmpeg headers/sources")
 
-option(FFMPEG_ENABLE_STATIC   "Build static FFmpeg libraries" ON)
-option(FFMPEG_ENABLE_SHARED   "Build shared FFmpeg libraries" OFF)
-option(FFMPEG_ENABLE_PROGRAMS "Build the ffmpeg/ffprobe/ffplay programs" ON)
+# Platform defaults: Android applications normally package shared libraries,
+# while a desktop build defaults to the traditional static archive.
+if(ANDROID)
+    set(_ffmpeg_default_static   OFF)
+    set(_ffmpeg_default_shared   ON)
+    set(_ffmpeg_default_programs OFF)
+else()
+    set(_ffmpeg_default_static   ON)
+    set(_ffmpeg_default_shared   OFF)
+    set(_ffmpeg_default_programs ON)
+endif()
+
+option(FFMPEG_ENABLE_STATIC   "Build static FFmpeg libraries" ${_ffmpeg_default_static})
+option(FFMPEG_ENABLE_SHARED   "Build shared FFmpeg libraries" ${_ffmpeg_default_shared})
+option(FFMPEG_ENABLE_PROGRAMS "Build the ffmpeg/ffprobe/ffplay programs" ${_ffmpeg_default_programs})
+
+# Single, discoverable selector.  AUTO keeps the two legacy switches above
+# authoritative; the other values override them for this configure run.
+set(FFMPEG_LIBRARY_TYPE "AUTO" CACHE STRING
+    "FFmpeg library type: AUTO, STATIC, SHARED or BOTH")
+set_property(CACHE FFMPEG_LIBRARY_TYPE PROPERTY STRINGS AUTO STATIC SHARED BOTH)
+
+if(NOT FFMPEG_LIBRARY_TYPE MATCHES "^(AUTO|STATIC|SHARED|BOTH)$")
+    message(FATAL_ERROR
+        "FFMPEG_LIBRARY_TYPE must be AUTO, STATIC, SHARED or BOTH "
+        "(got '${FFMPEG_LIBRARY_TYPE}')")
+endif()
+if(NOT FFMPEG_LIBRARY_TYPE STREQUAL "AUTO")
+    if(FFMPEG_LIBRARY_TYPE STREQUAL "STATIC")
+        set(FFMPEG_ENABLE_STATIC ON)
+        set(FFMPEG_ENABLE_SHARED OFF)
+    elseif(FFMPEG_LIBRARY_TYPE STREQUAL "SHARED")
+        set(FFMPEG_ENABLE_STATIC OFF)
+        set(FFMPEG_ENABLE_SHARED ON)
+    else()
+        set(FFMPEG_ENABLE_STATIC ON)
+        set(FFMPEG_ENABLE_SHARED ON)
+    endif()
+endif()
+if(NOT FFMPEG_ENABLE_STATIC AND NOT FFMPEG_ENABLE_SHARED)
+    message(FATAL_ERROR
+        "At least one of FFMPEG_ENABLE_STATIC / FFMPEG_ENABLE_SHARED must be ON")
+endif()
+
+if(ANDROID)
+    option(FFMPEG_ENABLE_JNI "Enable JNI support (Android)" ON)
+    option(FFMPEG_ENABLE_MEDIACODEC "Enable Android MediaCodec hwaccel" ON)
+endif()
+
+set(FFMPEG_ANDROID_NDK "" CACHE PATH
+    "Android NDK root (defaults to NAK_HOME, NDK_HOME or ANDROID_NDK_ROOT)")
 option(FFMPEG_DISABLE_EVERYTHING "Disable all FFmpeg components (like --disable-everything)" OFF)
 option(FFMPEG_ENABLE_GPL      "Allow GPL licensed parts (--enable-gpl)" OFF)
 option(FFMPEG_ENABLE_VERSION3 "Allow (L)GPLv3 parts (--enable-version3)" OFF)
@@ -90,10 +138,23 @@ ffmpeg_scan_dependency_metadata()
 ffmpeg_collect_metadata()
 ffmpeg_detect_features()
 
+if(ANDROID)
+    include(FFmpegAndroid)
+    ffmpeg_android_detect()
+endif()
+
 # ASM_NASM must be enabled in file scope.  Detection only marks it available
 # when nasm is present and can assemble FFmpeg's instructions.
 if(FFMPEG_X86ASM_AVAILABLE AND NOT CMAKE_ASM_NASM_COMPILER_LOADED)
     enable_language(ASM_NASM)
+endif()
+
+# ARM/AArch64 (and the other GNU-style architectures) ship preprocessed .S
+# sources.  They are compiled through the C compiler's assembler-with-cpp
+# mode, so the ASM language must be enabled before add_library().
+if(NOT MSVC AND NOT CMAKE_ASM_COMPILER_LOADED
+   AND FFMPEG_ARCH MATCHES "^(arm|aarch64|ppc|ppc64|mips|mips64|riscv|loongarch|s390|sparc|sparc64)$")
+    enable_language(ASM)
 endif()
 
 ffmpeg_detect_external_libraries()

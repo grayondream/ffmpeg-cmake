@@ -59,6 +59,59 @@ function(ffmpeg_slibsuf out)
     set(${out} "${_s}" PARENT_SCOPE)
 endfunction()
 
+# libswscale/aarch64 builds a small host tool (ops_static) and runs it to
+# emit ops_neon.gen.S.  The output stays in the build tree: the upstream
+# source tree is never modified.
+function(ffmpeg_generate_aarch64_ops include_dir)
+    ffmpeg_state_get("unstable" _unstable)
+    if(NOT _unstable STREQUAL "yes")
+        return()
+    endif()
+
+    if(CMAKE_CROSSCOMPILING)
+        find_program(FFMPEG_HOST_CC NAMES cc gcc clang)
+    else()
+        set(FFMPEG_HOST_CC "${CMAKE_C_COMPILER}")
+    endif()
+    if(NOT FFMPEG_HOST_CC)
+        message(FATAL_ERROR
+            "A host C compiler is required to generate "
+            "libswscale/aarch64/ops_neon.gen.S")
+    endif()
+
+    set(_gen_dir "${FFMPEG_GEN_DIR}/libswscale/aarch64")
+    file(MAKE_DIRECTORY "${_gen_dir}")
+    set(_host_exe "${_gen_dir}/ops_static")
+    if(CMAKE_HOST_WIN32)
+        string(APPEND _host_exe ".exe")
+    endif()
+    set(_src "${FFMPEG_SOURCE_DIR}/libswscale/aarch64/ops_static.c")
+    set(_out "${_gen_dir}/ops_neon.gen.S")
+
+    execute_process(
+        COMMAND "${FFMPEG_HOST_CC}" -std=gnu11
+                "-I${FFMPEG_SOURCE_DIR}" "-I${include_dir}"
+                -o "${_host_exe}" "${_src}"
+        RESULT_VARIABLE _cc_rc OUTPUT_QUIET ERROR_VARIABLE _cc_err)
+    if(NOT _cc_rc EQUAL 0)
+        message(FATAL_ERROR
+            "Failed to build host tool ops_static:\n${_cc_err}")
+    endif()
+
+    execute_process(
+        COMMAND "${_host_exe}"
+        RESULT_VARIABLE _run_rc
+        OUTPUT_FILE "${_out}.tmp"
+        ERROR_VARIABLE _run_err)
+    if(NOT _run_rc EQUAL 0)
+        file(REMOVE "${_out}.tmp")
+        message(FATAL_ERROR
+            "Failed to generate ${_out}:\n${_run_err}")
+    endif()
+    file(RENAME "${_out}.tmp" "${_out}")
+    ffmpeg_status("generated libswscale/aarch64/ops_neon.gen.S")
+endfunction()
+
 function(ffmpeg_generate_headers)
     set(_inc "${FFMPEG_GEN_DIR}/include")
     file(MAKE_DIRECTORY "${_inc}/libavutil")
@@ -235,6 +288,13 @@ function(ffmpeg_generate_headers)
         endif()
     endif()
 
+    if(FFMPEG_ARCH STREQUAL "aarch64")
+        ffmpeg_state_get("neon" _neon)
+        if(_neon STREQUAL "yes")
+            ffmpeg_generate_aarch64_ops("${_inc}")
+        endif()
+    endif()
+
     set(FFMPEG_INCLUDE_DIR "${_inc}" PARENT_SCOPE)
     ffmpeg_status("generated headers in ${_inc}")
 endfunction()
@@ -267,6 +327,12 @@ function(ffmpeg_generate_component_lists)
         endforeach()
 
         get_property(_extra GLOBAL PROPERTY "FFMPEG_LIST_EXTRA_${_key}")
+        # Version modules currently provide these as ordinary variables
+        # (e.g. FFMPEG_LIST_EXTRA_filters).  Accept both forms.
+        set(_extra_var "FFMPEG_LIST_EXTRA_${_key}")
+        if(DEFINED ${_extra_var})
+            list(APPEND _extra ${${_extra_var}})
+        endif()
         foreach(_e IN LISTS _extra)
             list(APPEND _symbols "${_e}")
         endforeach()
@@ -290,6 +356,16 @@ function(ffmpeg_summary)
     ffmpeg_status("FFmpeg version : ${FFMPEG_VERSION}")
     ffmpeg_status("source        : ${FFMPEG_SOURCE_DIR}")
     ffmpeg_status("generated     : ${FFMPEG_GEN_DIR}")
-    ffmpeg_status("static/shared : ${FFMPEG_ENABLE_STATIC}/${FFMPEG_ENABLE_SHARED}")
+    if(FFMPEG_ENABLE_STATIC AND FFMPEG_ENABLE_SHARED)
+        set(_libtype "both (static + shared)")
+    elseif(FFMPEG_ENABLE_SHARED)
+        set(_libtype "shared")
+    else()
+        set(_libtype "static")
+    endif()
+    ffmpeg_status("library type  : ${_libtype} (requested: ${FFMPEG_LIBRARY_TYPE})")
     ffmpeg_status("x86 assembly  : ${FFMPEG_X86ASM_AVAILABLE}")
+    if(ANDROID)
+        ffmpeg_status("android       : ABI ${ANDROID_ABI}, API ${ANDROID_PLATFORM}")
+    endif()
 endfunction()

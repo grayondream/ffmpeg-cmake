@@ -7,6 +7,15 @@
 
 # Map an object file to an existing source file.
 function(ffmpeg_object_source basedir obj out)
+    # libswscale/aarch64/ops_neon.gen.S is produced in the build tree by a
+    # host tool; it has no upstream counterpart to discover on disk.
+    if(_basedir STREQUAL "${FFMPEG_SOURCE_DIR}/libswscale"
+       AND obj STREQUAL "aarch64/ops_neon.gen.o")
+        set(${out} "${FFMPEG_GEN_DIR}/libswscale/aarch64/ops_neon.gen.S"
+            PARENT_SCOPE)
+        return()
+    endif()
+
     get_filename_component(_abs "${basedir}/${obj}" ABSOLUTE)
     string(REGEX REPLACE "\\.o$" "" _stem "${_abs}")
     foreach(_ext .c .S .cpp .m .asm)
@@ -95,6 +104,16 @@ function(ffmpeg_collect_library_sources lib out)
                 endif()
             elseif(_var STREQUAL "X86ASM-OBJS")
                 if(NOT FFMPEG_X86ASM_AVAILABLE)
+                    continue()
+                endif()
+            elseif(_var MATCHES "^([A-Z0-9_]+)-OBJS$")
+                # Architecture extension object lists: NEON-OBJS, ARMV8-OBJS,
+                # VFP-OBJS, ALTIVEC-OBJS, RVV-OBJS, ...  The feature name is
+                # the lower-case variable prefix and is resolved through the
+                # same config state used for *_deps.
+                string(TOLOWER "${CMAKE_MATCH_1}" _ext)
+                ffmpeg_state_get("${_ext}" _ext_state)
+                if(NOT _ext_state STREQUAL "yes")
                     continue()
                 endif()
             else()
@@ -237,6 +256,9 @@ function(ffmpeg_apply_compile_settings target)
             target_compile_options(${target} PRIVATE
                 "$<$<COMPILE_LANGUAGE:C,CXX>:${_opt}>")
         endforeach()
+        # ARM/AArch64 .S sources must be PIC too when building shared libs.
+        target_compile_options(${target} PRIVATE
+            "$<$<COMPILE_LANGUAGE:ASM>:-fPIC>")
         target_compile_definitions(${target} PRIVATE PIC)
     endif()
 
@@ -284,6 +306,12 @@ function(ffmpeg_apply_program_compile_settings target)
             -fno-math-errno -fno-signed-zeros -fno-trapping-math
             -Wno-unused-const-variable)
     endif()
+    if(ANDROID)
+        # configure's android branch adds -fPIE to all cflags and
+        # -fPIE -pie to executables.
+        target_compile_options(${target} PRIVATE -fPIE)
+        target_link_options(${target} PRIVATE -pie)
+    endif()
     set_target_properties(${target} PROPERTIES
         C_STANDARD 17 C_STANDARD_REQUIRED ON C_EXTENSIONS ON)
 endfunction()
@@ -310,21 +338,28 @@ function(ffmpeg_add_libraries)
 
         ffmpeg_library_versions("${_lib}" _version _soversion)
 
+        # Android's configure branch uses the plain libavcodec.so name with no
+        # version suffix or symlink chain (SLIB_INSTALL_NAME='$(SLIBNAME)').
+        set(_shared_version_props "")
+        if(NOT ANDROID)
+            set(_shared_version_props
+                VERSION "${_version}"
+                SOVERSION "${_soversion}")
+        endif()
+
         set(_target "ffmpeg_${_lib}")
         if(FFMPEG_ENABLE_SHARED AND NOT FFMPEG_ENABLE_STATIC)
             add_library(${_target} SHARED ${_sources})
             set_target_properties(${_target} PROPERTIES
                 OUTPUT_NAME "${_lib}"
-                VERSION "${_version}"
-                SOVERSION "${_soversion}")
+                ${_shared_version_props})
             ffmpeg_apply_shared_link_options(${_target})
         elseif(FFMPEG_ENABLE_SHARED AND FFMPEG_ENABLE_STATIC)
             add_library(${_target} STATIC ${_sources})
             add_library("${_target}_shared" SHARED ${_sources})
             set_target_properties("${_target}_shared" PROPERTIES
                 OUTPUT_NAME "${_lib}"
-                VERSION "${_version}"
-                SOVERSION "${_soversion}")
+                ${_shared_version_props})
             ffmpeg_apply_compile_settings("${_target}_shared")
             ffmpeg_apply_shared_link_options("${_target}_shared")
         else()
@@ -334,17 +369,6 @@ function(ffmpeg_add_libraries)
         set_target_properties(${_target} PROPERTIES OUTPUT_NAME "${_lib}")
         ffmpeg_apply_compile_settings(${_target})
         add_library("FFmpeg::${_lib}" ALIAS ${_target})
-
-        # Link dependencies (static link order matters, keep it).
-        set(_link_deps "${FFMPEG_LINK_DEPS_${_lib}}")
-        foreach(_dep IN LISTS _link_deps)
-            if(TARGET "ffmpeg_${_dep}")
-                target_link_libraries(${_target} PUBLIC "ffmpeg_${_dep}")
-                if(TARGET "${_target}_shared")
-                    target_link_libraries("${_target}_shared" PUBLIC "ffmpeg_${_dep}")
-                endif()
-            endif()
-        endforeach()
 
         # System libraries.
         set(_syslibs "")
@@ -357,6 +381,20 @@ function(ffmpeg_add_libraries)
         ffmpeg_state_get("zlib" _zlib_st)
         if(TARGET ZLIB::ZLIB AND _zlib_st STREQUAL "yes")
             list(APPEND _syslibs ZLIB::ZLIB)
+        endif()
+        if(ANDROID AND _lib STREQUAL "avdevice")
+            ffmpeg_state_get("android_camera_indev" _android_camera)
+            if(_android_camera STREQUAL "yes")
+                list(APPEND _syslibs camera2ndk mediandk android)
+            endif()
+        endif()
+        if(ANDROID AND _lib MATCHES "^(avutil|avcodec)$")
+            ffmpeg_state_get("mediacodec" _mediacodec)
+            if(_mediacodec STREQUAL "yes")
+                # ANativeWindow_* lives in libandroid.  The wrapper also uses
+                # the NDK MediaCodec/MediaFormat entry points directly.
+                list(APPEND _syslibs android mediandk)
+            endif()
         endif()
         get_property(_extra_libs GLOBAL PROPERTY FFMPEG_EXTRA_SYSTEM_LIBS)
         if(_extra_libs)
@@ -392,6 +430,31 @@ function(ffmpeg_add_libraries)
         list(LENGTH _sources _n)
         ffmpeg_status("lib${_lib}: ${_n} source files (${_version})")
     endforeach()
+
+    # Link dependencies in a second pass: avcodec is created before avutil in
+    # the link-order list, so target_link_libraries() cannot see the dependency
+    # targets during the first pass.  Shared-library links need these entries
+    # (Android's linker runs with --no-undefined).
+    foreach(_lib IN LISTS FFMPEG_LIBRARY_LIST)
+        if(NOT TARGET "ffmpeg_${_lib}")
+            continue()
+        endif()
+        set(_link_deps "${FFMPEG_LINK_DEPS_${_lib}}")
+        foreach(_dep IN LISTS _link_deps)
+            if(TARGET "ffmpeg_${_dep}")
+                target_link_libraries("ffmpeg_${_lib}" PUBLIC "ffmpeg_${_dep}")
+                if(TARGET "ffmpeg_${_lib}_shared")
+                    if(TARGET "ffmpeg_${_dep}_shared")
+                        target_link_libraries("ffmpeg_${_lib}_shared"
+                            PUBLIC "ffmpeg_${_dep}_shared")
+                    else()
+                        target_link_libraries("ffmpeg_${_lib}_shared"
+                            PUBLIC "ffmpeg_${_dep}")
+                    endif()
+                endif()
+            endif()
+        endforeach()
+    endforeach()
 endfunction()
 
 function(ffmpeg_link_external_libraries target)
@@ -400,6 +463,10 @@ function(ffmpeg_link_external_libraries target)
     foreach(_name IN LISTS _extlibs)
         ffmpeg_state_get("${_name}" _st)
         if(NOT _st STREQUAL "yes")
+            continue()
+        endif()
+        # SDL2 is a dependency of the ffplay tool only, not of the libraries.
+        if(_name STREQUAL "sdl2")
             continue()
         endif()
         string(TOUPPER "${_name}" _up)

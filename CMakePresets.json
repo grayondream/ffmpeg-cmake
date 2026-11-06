@@ -1,0 +1,57 @@
+{
+  "version": 2,
+  "configurePresets": [
+    {
+      "name": "linux-static",
+      "displayName": "Linux static",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-linux-static",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "FFMPEG_LIBRARY_TYPE": "STATIC"
+      }
+    },
+    {
+      "name": "linux-shared",
+      "displayName": "Linux shared",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-linux-shared",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "FFMPEG_LIBRARY_TYPE": "SHARED"
+      }
+    },
+    {
+      "name": "android-arm64-shared",
+      "displayName": "Android arm64-v8a shared",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-android-arm64-shared",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/cmake/android.toolchain.cmake",
+        "ANDROID_ABI": "arm64-v8a",
+        "ANDROID_PLATFORM": "android-24",
+        "FFMPEG_LIBRARY_TYPE": "SHARED",
+        "FFMPEG_ENABLE_PROGRAMS": "OFF",
+        "FFMPEG_ENABLE_JNI": "ON",
+        "FFMPEG_ENABLE_MEDIACODEC": "ON"
+      }
+    },
+    {
+      "name": "android-arm64-static",
+      "displayName": "Android arm64-v8a static",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-android-arm64-static",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/cmake/android.toolchain.cmake",
+        "ANDROID_ABI": "arm64-v8a",
+        "ANDROID_PLATFORM": "android-24",
+        "FFMPEG_LIBRARY_TYPE": "STATIC",
+        "FFMPEG_ENABLE_PROGRAMS": "OFF",
+        "FFMPEG_ENABLE_JNI": "ON",
+        "FFMPEG_ENABLE_MEDIACODEC": "ON"
+      }
+    }
+  ]
+}
